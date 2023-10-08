@@ -1,15 +1,23 @@
 package com.chrissytopher.beam
 
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -31,28 +39,117 @@ import com.google.android.gms.nearby.connection.Payload
 import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
+import kotlin.math.pow
 
 class MainActivity : ComponentActivity() {
     private val strategy = Strategy.P2P_CLUSTER
     private val serviceId = "com.chrissytopher.beam"
 
+    private lateinit var bluetoothAdapter: BluetoothAdapter
+
     private lateinit var connectionsClient: ConnectionsClient
     private lateinit var gyroscopeSensor: Sensor
     private lateinit var sensorManager: SensorManager
 
-    private val payloadCallback = object : PayloadCallback() {
-        override fun onPayloadReceived(endpointId: String, payload: Payload) {
-            payload.asBytes()?.decodeToString()?.let {payloadText ->
-                Log.d("Beam", "received message from $endpointId, $payloadText")
-                if (payloadText.startsWith("G")) {
-                    try {
-                        val remoteGyroData = payloadText.substring(1).split(";").map { it.toFloat() }
-                        val gyroDot = remoteGyroData[0]*currentGyroData[0]+remoteGyroData[1]*currentGyroData[1]+remoteGyroData[2]*currentGyroData[2]
-                        if (gyroDot > 0.9) {
-                            Toast.makeText(this@MainActivity, "Beam!", Toast.LENGTH_LONG).show()
+    private lateinit var myEndpointId: String
+    private var bluetoothServer = false
+    private lateinit var targetBTName: String
+
+    private fun sendPayload(endpointId: String, header: Int, message: ByteArray) {
+        connectionsClient.sendPayload(endpointId, Payload.fromBytes(arrayOf(header.toByte()).toByteArray()+message))
+    }
+
+    private val receiver = object : BroadcastReceiver() {
+
+        @SuppressLint("MissingPermission")
+        override fun onReceive(context: Context, intent: Intent) {
+            Log.d("Beam", "received broadcast")
+            when(intent.action) {
+                BluetoothDevice.ACTION_FOUND -> {
+                    Log.d("Beam", "device found")
+                    // Discovery has found a device. Get the BluetoothDevice
+                    // object and its info from the Intent.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                    } else {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    }?.let {device ->
+                        val rssi: Int = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE).toInt()
+                        val close = isDeviceVeryClose(rssi, -50, 2.0)
+                        Log.d("BluetoothDevice", "Device: ${device.name} - $rssi, close: $close")
+                        Log.d("Beam Bluetooth Discovery", "found device: $device, ${device.name}")
+                        if (device.name == targetBTName) {
+                            Log.d("Beam", "the device is the correct device")
                         }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == USER_FINISHED_DISCOVER_REQ) {
+            Log.d("Beam", "user finished discover req: $resultCode")
+            if (resultCode != RESULT_CANCELED) {
+                BluetoothServerThread(bluetoothAdapter) {
+                    Log.d("Beam", "connected to bluetooth")
+                }.start()
+            }
+        }
+    }
+
+    fun isDeviceVeryClose(rssi: Int, rssiAtOneMeter: Int, pathLossExponent: Double): Boolean {
+        // Convert inches to meters. 6 inches is approximately 0.1524 meters.
+        val thresholdDistance = 0.1524
+
+        // Using the path-loss model to estimate distance.
+        val estimatedDistance = 10.0.pow((rssiAtOneMeter - rssi) / (10 * pathLossExponent))
+
+        return estimatedDistance <= thresholdDistance
+    }
+
+
+    private val payloadCallback = object : PayloadCallback() {
+        @SuppressLint("MissingPermission")
+        override fun onPayloadReceived(endpointId: String, payloadRaw: Payload) {
+            payloadRaw.asBytes()?.let {payload ->
+                val messageHeader = payload[0].toInt()
+                val message = payload.slice(1 until payload.size).toByteArray()
+                if (messageHeader == ENDPOINT_EXCHANGE_HEADER) {
+                    myEndpointId = message.decodeToString()
+                    Log.d("Beam", "my endpoint is $myEndpointId")
+                    bluetoothServer = arrayOf(endpointId, myEndpointId).apply { sort() }[0] == myEndpointId
+                    sendPayload(endpointId, BLUETOOTH_NAME_EXCHANGE_HEADER, bluetoothAdapter.name.encodeToByteArray())
+                }
+                if (messageHeader == BLUETOOTH_NAME_EXCHANGE_HEADER) {
+                    targetBTName = message.decodeToString()
+                    Log.d("Beam", "target Bluetooth name $targetBTName")
+                    setContent {
+                        Column {
+                            Text("Connected to $endpointId, negotiating bluetooth")
+                            Text("Looking for connect to bluetooth from device $targetBTName")
+                            Text("I am ${if (bluetoothServer) "Server" else "Client"}")
+                        }
+                    }
+                    if (!bluetoothServer) {
+                        Log.d("Beam", "starting bluetooth discovery client")
+                        if (!bluetoothAdapter.startDiscovery()) {
+                            Log.e("Beam", "failed to start bluetooth discovery client")
+                        }
+                        val filter = IntentFilter(BluetoothDevice.ACTION_FOUND)
+                        registerReceiver(receiver, filter)
+                        sendPayload(endpointId, STARTED_BLUETOOTH_CLIENT, ByteArray(0))
+                    }
+                }
+                if (messageHeader == STARTED_BLUETOOTH_CLIENT) {
+                    if (bluetoothServer) {
+                        Log.d("Beam", "starting bluetooth server")
+                        val requestCode = USER_FINISHED_DISCOVER_REQ
+                        val discoverableIntent: Intent = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).apply {
+                            putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
+                        }
+                        startActivityForResult(discoverableIntent, requestCode)
                     }
                 }
             }
@@ -88,15 +185,13 @@ class MainActivity : ComponentActivity() {
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             if (result.status.isSuccess) {
                 Log.d("Beam", "connection to $endpointId succeeded")
+                connectionsClient.stopDiscovery()
+                connectionsClient.stopAdvertising()
                 activeConnections.add(endpointId)
-                Thread {
-                    while (activeConnections.contains(endpointId)) {
-                        Log.d("Beam", "sending message to $endpointId")
-                        val bytesPayload = Payload.fromBytes("G${currentGyroData[0]};${currentGyroData[1]};${currentGyroData[2]}".toByteArray(Charsets.UTF_8))
-                        connectionsClient.sendPayload(endpointId, bytesPayload)
-                        Thread.sleep(100)
-                    }
-                }.start()
+                sendPayload(endpointId, ENDPOINT_EXCHANGE_HEADER, endpointId.encodeToByteArray())
+                setContent {
+                    Text("Connected to $endpointId, negotiating bluetooth")
+                }
             } else {
                 Log.d("Beam", "connection to $endpointId failed, ${result.status}")
             }
@@ -120,9 +215,14 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         connectionsClient = Nearby.getConnectionsClient(this)
+
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         gyroscopeSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
         sensorManager.registerListener(gyroscopeEventListener, gyroscopeSensor, SensorManager.SENSOR_DELAY_NORMAL)
+
+        val bluetoothManager: BluetoothManager = getSystemService(BluetoothManager::class.java)
+        bluetoothAdapter = bluetoothManager.adapter
+
         setContent {
             BeamTheme {
                 // A surface container using the 'background' color from the theme
@@ -172,6 +272,14 @@ class MainActivity : ComponentActivity() {
         connectionsClient.stopAdvertising()
         connectionsClient.stopDiscovery()
         sensorManager.unregisterListener(gyroscopeEventListener)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try {
+            unregisterReceiver(receiver)
+            Log.d("Beam", "stopping bluetooth discovery")
+        } catch (_: IllegalArgumentException) {}
     }
 }
 
